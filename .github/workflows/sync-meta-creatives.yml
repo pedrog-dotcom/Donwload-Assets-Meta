@@ -1,0 +1,75 @@
+name: Sync criativos Meta Ads -> Google Drive
+
+on:
+  schedule:
+    # Todo dia às 07:17 (horário de Brasília) = 10:17 UTC
+    - cron: "17 10 * * *"
+  workflow_dispatch: {}
+
+# Nunca roda duas execuções ao mesmo tempo (evita upload duplicado)
+concurrency:
+  group: meta-creatives-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Instalar dependências
+        run: pip install -r requirements.txt
+
+      - name: Sincronizar criativos
+        env:
+          META_ACCESS_TOKEN: ${{ secrets.META_ACCESS_TOKEN }}
+          META_AD_ACCOUNT_ID: ${{ secrets.META_AD_ACCOUNT_ID }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+          # Opção A: Service Account (pasta precisa estar num Drive compartilhado)
+          GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
+          # Opção B: OAuth do seu usuário (funciona em "Meu Drive")
+          GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+          GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+          GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
+          # Ajustes opcionais
+          APPEND_EXTENSION: "false"
+          FAIL_ON_ERRORS: "false"
+          MAX_MINUTES: "330"
+        run: python sync_meta_creatives.py
+
+      - name: Salvar relatório de falhas
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failures-${{ github.run_id }}
+          path: failures.csv
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # O GitHub desativa workflows agendados após 60 dias sem commits no repo.
+  # Este job faz um commit vazio a cada ~50 dias para manter o agendamento vivo.
+  keepalive:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Commit de keepalive se necessário
+        run: |
+          last=$(git log -1 --format=%ct)
+          now=$(date +%s)
+          if [ $(( (now - last) / 86400 )) -ge 50 ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "keepalive: mantém o agendamento ativo"
+            git push
+          fi
