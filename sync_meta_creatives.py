@@ -34,11 +34,23 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
 # ====================== CONFIGURAÇÃO ======================
-META_TOKEN = os.environ["META_ACCESS_TOKEN"].strip()
-AD_ACCOUNT_ID = os.environ["META_AD_ACCOUNT_ID"].strip()
-if not AD_ACCOUNT_ID.startswith("act_"):
+def gh_error(title: str, msg: str) -> None:
+    """Erro visível como anotação no GitHub Actions."""
+    clean = str(msg).replace("%", "%25").replace("\r", "").replace("\n", "%0A")
+    print(f"::error title={title}::{clean}", flush=True)
+
+
+def env(name: str) -> str:
+    return (os.getenv(name) or "").strip()
+
+
+META_TOKEN = env("META_ACCESS_TOKEN")
+AD_ACCOUNT_ID = env("META_AD_ACCOUNT_ID")
+if AD_ACCOUNT_ID and not AD_ACCOUNT_ID.startswith("act_"):
     AD_ACCOUNT_ID = f"act_{AD_ACCOUNT_ID}"
-DRIVE_FOLDER_ID = os.environ["GDRIVE_FOLDER_ID"].strip()
+DRIVE_FOLDER_ID = env("GDRIVE_FOLDER_ID")
+if "/folders/" in DRIVE_FOLDER_ID:  # aceita a URL inteira da pasta
+    DRIVE_FOLDER_ID = DRIVE_FOLDER_ID.split("/folders/")[1].split("?")[0].split("/")[0]
 
 API_VERSION = os.getenv("META_API_VERSION", "v23.0")
 BASE_URL = f"https://graph.facebook.com/{API_VERSION}"
@@ -326,9 +338,29 @@ def download(url: str, dest_dir: str, idx: int, retries: int = 3) -> tuple[str, 
 # ---------------------------------------------------------------------------
 # Google Drive
 # ---------------------------------------------------------------------------
+def check_config() -> list[str]:
+    problems = []
+    for name in ("META_ACCESS_TOKEN", "META_AD_ACCOUNT_ID", "GDRIVE_FOLDER_ID"):
+        if not env(name):
+            problems.append(f"Secret {name} está vazio ou não existe")
+    has_sa = bool(env("GDRIVE_SA_JSON"))
+    oauth = [n for n in ("GDRIVE_CLIENT_ID", "GDRIVE_CLIENT_SECRET", "GDRIVE_REFRESH_TOKEN") if env(n)]
+    if not has_sa and len(oauth) < 3:
+        problems.append(
+            "Credencial do Drive ausente: preencha GDRIVE_SA_JSON (Opção A) ou os 3 secrets "
+            f"GDRIVE_CLIENT_ID / GDRIVE_CLIENT_SECRET / GDRIVE_REFRESH_TOKEN (Opção B). Encontrados: {oauth or 'nenhum'}"
+        )
+    if has_sa:
+        try:
+            json.loads(env("GDRIVE_SA_JSON"))
+        except ValueError:
+            problems.append("GDRIVE_SA_JSON não é um JSON válido (cole o arquivo inteiro, com as chaves {})")
+    return problems
+
+
 def drive_client():
     scopes = ["https://www.googleapis.com/auth/drive"]
-    sa_json = os.getenv("GDRIVE_SA_JSON", "").strip()
+    sa_json = env("GDRIVE_SA_JSON")
     if sa_json:
         creds = service_account.Credentials.from_service_account_info(json.loads(sa_json), scopes=scopes)
     else:
@@ -434,14 +466,35 @@ def write_reports(failures: list[dict], stats: dict) -> None:
 # Main
 # ---------------------------------------------------------------------------
 def main() -> int:
-    svc = drive_client()
+    problems = check_config()
+    if problems:
+        for p in problems:
+            gh_error("Configuração", p)
+        return 1
 
-    log("Lendo o que já existe na pasta do Drive...")
-    existing = existing_names(svc)
-    log(f"   {len(existing)} nomes já no Drive")
+    # Teste rápido do token do Meta antes de qualquer coisa
+    me = meta_get(AD_ACCOUNT_ID, {"fields": "id,name,account_status"}, retries=2)
+    if "error" in me:
+        gh_error("Meta API", f"Token/conta inválidos para {AD_ACCOUNT_ID}: {me['error'].get('message')}")
+        return 1
+    log(f"Conta Meta OK: {me.get('name')} ({AD_ACCOUNT_ID})")
+
+    try:
+        svc = drive_client()
+        log("Lendo o que já existe na pasta do Drive...")
+        existing = existing_names(svc)
+        meta = svc.files().get(fileId=DRIVE_FOLDER_ID, fields="name", supportsAllDrives=True).execute()
+    except Exception as exc:  # noqa: BLE001
+        gh_error("Google Drive", f"Falha ao acessar a pasta {DRIVE_FOLDER_ID}: {exc}")
+        return 1
+    log(f"   Pasta '{meta.get('name')}': {len(existing)} nomes já no Drive")
 
     log(f"Listando anúncios da conta {AD_ACCOUNT_ID}...")
-    ads = fetch_all_ads()
+    try:
+        ads = fetch_all_ads()
+    except Exception as exc:  # noqa: BLE001
+        gh_error("Meta API", str(exc))
+        return 1
     # Mais antigo primeiro: em nomes duplicados, o anúncio original fica com o nome
     ads.sort(key=lambda a: (a.get("created_time") or "", a.get("id") or ""))
 
@@ -532,9 +585,17 @@ def main() -> int:
     }
     write_reports(failures, stats)
     log(" | ".join(f"{k}: {v}" for k, v in stats.items()))
+    print("::notice title=Resumo::" + " | ".join(f"{k}: {v}" for k, v in stats.items()), flush=True)
+    if failures:
+        print(f"::warning title=Falhas::{len(failures)} anúncio(s) falharam. Veja o artefato failures.csv", flush=True)
 
     return 1 if (FAIL_ON_ERRORS and failures) else 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except Exception as exc:  # noqa: BLE001
+        import traceback
+        gh_error("Erro inesperado", f"{type(exc).__name__}: {exc}\n{traceback.format_exc()[-1500:]}")
+        sys.exit(1)
